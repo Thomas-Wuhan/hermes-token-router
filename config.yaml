@@ -1,0 +1,129 @@
+# Hermes Token 路由代理配置
+# 按《Hermes 智能体 Token 优化与模型路由技术方案》实施
+# ⚠️ 只放配置，API Key 一律走环境变量（见 api_key_env）
+
+server:
+  host: 127.0.0.1
+  port: 8787
+
+# 最终兜底（付费，永远可用 —— 保证不中断）
+final_fallback:
+  provider: deepseek
+  model: deepseek-v4-flash
+
+# 数据分级（第8章红线）：confidential 只允许走付费 provider
+security:
+  default_classification: internal      # public | internal | confidential
+  paid_only_providers: [deepseek]       # 免费层数据会被用于训练，禁止发敏感数据
+
+# 延迟预算（第12.6章）
+budget:
+  total_seconds: 60          # 总预算（Hermes 长任务较慢，放宽）
+  l1_timeout_seconds: 25     # 免费层单次硬超时
+  escalate_min_remaining: 10 # 剩余预算低于此值不再升级重跑
+
+# Provider 定义
+providers:
+  deepseek:
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+    paid: true
+    rpm: 60
+    tpm: 1000000
+    use_proxy: false          # 国内直连更快
+  groq:
+    base_url: https://api.groq.com/openai/v1
+    api_key_env: GROQ_API_KEY
+    paid: false
+    rpm: 30
+    tpm: 6000
+    use_proxy: true           # 国内需走代理
+  gemini:
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+    api_key_env: GEMINI_API_KEY
+    paid: false
+    rpm: 10
+    tpm: 250000
+    use_proxy: true
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    paid: false
+    rpm: 20
+    tpm: 200000
+    use_proxy: true
+  siliconflow:
+    base_url: https://api.siliconflow.cn/v1
+    api_key_env: SILICONFLOW_API_KEY
+    paid: false
+    rpm: 1000                 # 实测 L0 级免费额度 RPM 1000
+    tpm: 50000
+    use_proxy: false          # 国内直连
+    extra:                    # 额外请求参数（实测：关思考 19.5s→0.7s，token 省 95%）
+      enable_thinking: false
+
+# 路由规则（第4.2章：先硬编码规则，后分类器）
+# 匹配顺序从上到下，第一个命中者生效
+routes:
+  # ---- 【最高优先级】后台压缩/摘要：用户无感延迟，token 消耗却最大 ----
+  - name: background_summarize
+    priority: 5
+    when:
+      no_tools: true
+      max_input_tokens: 200000
+      keywords: ["compress", "condense", "summarize the conversation", "conversation summary",
+                 "context compression", "compress the", "历史对话", "压缩对话", "对话摘要",
+                 "总结对话", "上下文压缩", "摘要以下", "请总结以上"]
+    chain:
+      - [siliconflow, Qwen/Qwen3-8B]                    # 免费 + 直连 + 关思考 0.7s ⭐
+      - [siliconflow, Qwen/Qwen3.5-4B]                  # 更小备用
+      - [groq, qwen/qwen3.8-27b]                        # 走代理较慢
+      - [openrouter, qwen/qwen3.8-27b:free]
+      - [deepseek, deepseek-v4-flash]                   # 兜底
+    max_tokens: 4000
+
+  # ---- 简单任务池：无工具、短输入、命中特征关键词 ----
+  - name: simple_task
+    priority: 10
+    when:
+      no_tools: true
+      # 实测：走代理的免费池延迟 20s+，DeepSeek 直连仅 1s
+      # → 短请求（token 消耗小）不值得为省几分钱等 20 秒，交给直连
+      # → 只有长输入（token 大户）才走免费池
+      min_input_tokens: 3000
+      max_input_tokens: 60000
+      keywords: [翻译, 改写, 润色, 总结, 摘要, 分类, 抽取, 提取, 打标签,
+                 translate, rewrite, summarize, classify, extract, format]
+    chain:                                  # 按能力选模型（不硬编码单一模型名）
+      - [siliconflow, Qwen/Qwen3-8B]                    # 免费 + 国内直连 0.7s ⭐
+      - [siliconflow, Qwen/Qwen3.5-4B]
+      - [groq, qwen/qwen3.8-27b]                        # 走代理（慢，备用）
+      - [openrouter, qwen/qwen3.8-27b:free]
+      - [deepseek, deepseek-v4-flash]                   # 最终兜底
+    max_tokens: 800
+
+  # ---- 长文档池：上下文很大但不需要工具 ----
+  - name: long_context
+    priority: 20
+    when:
+      no_tools: true
+      min_input_tokens: 30000
+    chain:
+      - [openrouter, nvidia/nemotron-3-ultra-550b-a55b:free]   # 1M 上下文
+      - [groq, openai/gpt-oss-120b]
+      - [gemini, gemini-3.5-flash]                             # 待配 Key
+      - [deepseek, deepseek-v4-flash]
+    max_tokens: 2000
+
+  # ---- 默认：主力模型（含所有带工具调用的请求）----
+  - name: default
+    priority: 100
+    when: {}
+    chain:
+      - [deepseek, deepseek-v4-flash]
+    max_tokens: 8000
+
+# 观测（第12.4章）
+observe:
+  log_file: logs/route_log.jsonl
+  enabled: true
