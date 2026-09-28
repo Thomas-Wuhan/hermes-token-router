@@ -124,6 +124,13 @@ routes:
       - [deepseek, deepseek-v4-flash]
     max_tokens: 8000
 
+# 缓存（方案第 5 章）
+cache:
+  enabled: true
+  threshold: 0.97        # 语义相似度阈值（≥ 视为命中）
+  ttl: 86400             # 24 小时过期
+  max_entries: 500       # LRU 上限
+
 # 观测（第12.4章）
 observe:
   log_file: logs/route_log.jsonl

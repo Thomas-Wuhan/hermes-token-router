@@ -22,6 +22,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from providers import ProviderError, ProviderPool
 from routing import classify_data, decide, extract_features, est_tokens
+from cache import ResponseCache, embed_text
+from validator import ESCALATION_CHAIN, VALIDATOR
 
 BASE = Path(__file__).resolve().parent
 CFG = yaml.safe_load((BASE / "config.yaml").read_text(encoding="utf-8"))
@@ -41,6 +43,12 @@ OBS = CFG.get("observe", {})
 POOL = ProviderPool(CFG["providers"], SEC.get("paid_only_providers"), BUDGET.get("l1_timeout_seconds", 25))
 LOG_PATH = BASE / OBS.get("log_file", "logs/route_log.jsonl")
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+CACHE = ResponseCache(str(BASE / "logs" / "cache.db"),
+                      threshold=CFG.get("cache", {}).get("threshold", 0.97),
+                      ttl=CFG.get("cache", {}).get("ttl", 86400),
+                      max_entries=CFG.get("cache", {}).get("max_entries", 500))
+CACHE_ENABLED = CFG.get("cache", {}).get("enabled", True)
 
 # 运行统计
 STATS = {"requests": 0, "by_route": {}, "by_provider": {}, "degraded": 0}
@@ -79,6 +87,8 @@ async def health():
                           "breaker": POOL.breaker.snapshot().get(n)} for n in CFG["providers"]},
         "stats": STATS,
         "pool": POOL.stats,
+        "cache": CACHE.info(),
+        "validator": VALIDATOR.stats,
     }
 
 
@@ -133,15 +143,55 @@ async def chat_completions(request: Request):
 
     if stream:
         return await _handle_stream(chain, payload, route, feats, classification, t0)
-    return await _handle_normal(chain, payload, route, feats, classification, t0)
+
+    # ---- 缓存查询（仅无工具 + 非流式）----
+    use_cache = CACHE_ENABLED and ResponseCache.cacheable(payload, route["name"])
+    if use_cache:
+        hit = CACHE.get_exact(payload)
+        if hit:
+            STATS["cache_hits"] = STATS.get("cache_hits", 0) + 1
+            log.info("缓存命中（精确）| 延迟 %.3fs", time.monotonic() - t0)
+            observe({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "route": route["name"], "cached": "exact",
+                     "provider": "cache", "model": "-", "latency": round(time.monotonic() - t0, 3)})
+            return JSONResponse(hit, headers={"X-Router-Cache": "exact"})
+        # 语义缓存（需要 embedding）
+        sf_key = os.environ.get("SILICONFLOW_API_KEY", "")
+        if sf_key:
+            emb = await embed_text(feats["text"], await POOL.client("siliconflow"), sf_key)
+            if emb:
+                sem = CACHE.get_semantic(emb)
+                if sem:
+                    STATS["cache_hits"] = STATS.get("cache_hits", 0) + 1
+                    log.info("缓存命中（语义）| 延迟 %.3fs", time.monotonic() - t0)
+                    observe({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "route": route["name"], "cached": "semantic",
+                             "provider": "cache", "model": "-", "latency": round(time.monotonic() - t0, 3)})
+                    return JSONResponse(sem, headers={"X-Router-Cache": "semantic"})
+
+    return await _handle_normal(chain, payload, route, feats, classification, t0, use_cache)
 
 
-async def _handle_normal(chain, payload, route, feats, classification, t0):
+async def _handle_normal(chain, payload, route, feats, classification, t0, use_cache=False):
     try:
         data, provider, model = await POOL.call_with_chain(chain, payload, classification, FINAL)
     except ProviderError as e:
         log.error("全部失败: %s", e)
         return JSONResponse({"error": {"message": str(e)}}, status_code=502)
+
+    # ---- 校验层：内容不合格则升级重跑（方案 4.3，最多升 1 级防烧 token）----
+    ok, reason = VALIDATOR.check(payload, data, route["name"])
+    escalated = False
+    if not ok and provider != "deepseek":
+        VALIDATOR.note_escalation()
+        STATS["escalated"] = STATS.get("escalated", 0) + 1
+        log.warning("校验失败(%s) → 升级重跑", reason)
+        try:
+            data, provider, model = await POOL.call_with_chain(ESCALATION_CHAIN, payload, classification, FINAL)
+            escalated = True
+            ok2, reason2 = VALIDATOR.check(payload, data, route["name"])
+            if not ok2:
+                log.warning("升级后仍不合格(%s)，返回并标注", reason2)
+        except ProviderError as e:
+            log.error("升级重跑失败: %s", e)
 
     latency = round(time.monotonic() - t0, 2)
     u = data.get("usage") or {}
@@ -150,10 +200,22 @@ async def _handle_normal(chain, payload, route, feats, classification, t0):
              "provider": provider, "model": model, "latency": latency,
              "in_tokens": u.get("prompt_tokens"), "out_tokens": u.get("completion_tokens"),
              "classification": classification, "tool_count": feats["tool_count"],
-             "est_in": feats["input_tokens"], "ok": True})
-    log.info("完成 | %s/%s | %.2fs | in=%s out=%s", provider, model, latency,
-             u.get("prompt_tokens"), u.get("completion_tokens"))
-    return JSONResponse(data)
+             "est_in": feats["input_tokens"], "ok": True, "escalated": escalated})
+    log.info("完成 | %s/%s | %.2fs | in=%s out=%s%s", provider, model, latency,
+             u.get("prompt_tokens"), u.get("completion_tokens"), " [升级重跑]" if escalated else "")
+
+    # ---- 写缓存（仅无工具可缓存请求）----
+    if use_cache:
+        emb = None
+        sf_key = os.environ.get("SILICONFLOW_API_KEY", "")
+        if sf_key:
+            emb = await embed_text(feats["text"], await POOL.client("siliconflow"), sf_key)
+        CACHE.store(payload, data, emb)
+
+    headers = {"X-Router-Provider": provider, "X-Router-Model": model}
+    if escalated:
+        headers["X-Router-Escalated"] = "1"
+    return JSONResponse(data, headers=headers)
 
 
 async def _handle_stream(chain, payload, route, feats, classification, t0):
