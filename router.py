@@ -82,6 +82,14 @@ async def health():
     }
 
 
+@app.post("/admin/reset_breaker")
+async def reset_breaker():
+    """手动重置熔断状态（性能排查用）"""
+    POOL.reset_breaker()
+    log.info("熔断状态已重置")
+    return {"status": "ok", "breakers": POOL.breaker.snapshot()}
+
+
 @app.get("/v1/models")
 async def list_models():
     """Hermes 可能查询模型列表——返回兜底模型名，保证兼容。"""
@@ -163,13 +171,16 @@ async def _handle_stream(chain, payload, route, feats, classification, t0):
             if resp.status_code >= 400:
                 text = (await resp.aread())[:200].decode("utf-8", "ignore")
                 await resp.aclose()
+                POOL.breaker.record(provider, False, POOL._exempt(provider))   # 流式失败也计入熔断统计
                 last_err = f"{provider} {resp.status_code}: {text}"
                 log.warning("流式失败 %s → 切换下一家: %s", provider, last_err)
                 continue
 
+            POOL.breaker.record(provider, True, POOL._exempt(provider))
             STATS["by_provider"][provider] = STATS["by_provider"].get(provider, 0) + 1
             observe({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "stream": True, "route": route["name"],
                      "provider": provider, "model": model, "classification": classification,
+                     "latency": round(time.monotonic() - t0, 2),
                      "tool_count": feats["tool_count"], "est_in": feats["input_tokens"], "ok": True})
 
             async def gen(r=resp):

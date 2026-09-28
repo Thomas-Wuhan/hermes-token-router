@@ -31,6 +31,7 @@ providers:
     rpm: 60
     tpm: 1000000
     use_proxy: false          # 国内直连更快
+    no_breaker: true          # 兜底永不熔断（最后防线，熔断它会导致请求 fallback 到慢的免费池）
   groq:
     base_url: https://api.groq.com/openai/v1
     api_key_env: GROQ_API_KEY

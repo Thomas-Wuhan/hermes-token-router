@@ -46,9 +46,12 @@ class CircuitBreaker:
     def allow(self, provider: str) -> bool:
         return time.monotonic() > self.banned_until.get(provider, 0)
 
-    def record(self, provider: str, ok: bool):
+    def record(self, provider: str, ok: bool, exempt: bool = False):
+        """exempt=True（兜底 provider）只统计不熔断 —— 它是最后防线，必须永远可用"""
         s = self.stats.setdefault(provider, [0, 0])
         s[0 if ok else 1] += 1
+        if exempt:
+            return
         total = s[0] + s[1]
         if total >= self.min_samples and (s[1] / total) > self.threshold:
             self.banned_until[provider] = time.monotonic() + self.cooldown
@@ -99,6 +102,19 @@ class ProviderPool:
             self._clients[use_proxy] = c
         return c
 
+    def _exempt(self, provider: str) -> bool:
+        """兜底 provider（config: no_breaker: true）永不被熔断"""
+        return bool(self.cfg.get(provider, {}).get("no_breaker"))
+
+    def reset_breaker(self, provider: str | None = None):
+        """重置熔断状态（性能排查用）"""
+        if provider:
+            self.breaker.banned_until.pop(provider, None)
+            self.breaker.stats.pop(provider, None)
+        else:
+            self.breaker.banned_until.clear()
+            self.breaker.stats.clear()
+
     def available(self, provider: str, classification: str) -> bool:
         """数据分级检查（第 8 章红线）：confidential 只走付费 provider"""
         if classification == "confidential" and provider not in self.paid_only:
@@ -131,7 +147,7 @@ class ProviderPool:
             raise ProviderError(provider, "fatal", f"数据分级 {classification} 禁止走该 provider")
         if not self.has_key(provider):
             raise ProviderError(provider, "fatal", "缺少 API Key")
-        if not self.breaker.allow(provider):
+        if not self._exempt(provider) and not self.breaker.allow(provider):
             raise ProviderError(provider, "fatal", "熔断中")
 
         body = dict(payload)
@@ -148,23 +164,23 @@ class ProviderPool:
             r = await client.post(f"{self.cfg[provider]['base_url']}/chat/completions",
                                   headers=self._headers(provider), json=body)
         except (httpx.ConnectTimeout, httpx.ReadTimeout) as e:
-            self.breaker.record(provider, False)
+            self.breaker.record(provider, False, self._exempt(provider))
             raise ProviderError(provider, "timeout", str(e))
         except Exception as e:
-            self.breaker.record(provider, False)
+            self.breaker.record(provider, False, self._exempt(provider))
             raise ProviderError(provider, "transient", str(e))
 
         if r.status_code == 429:
-            self.breaker.record(provider, False)
+            self.breaker.record(provider, False, self._exempt(provider))
             raise ProviderError(provider, "rate_limit", r.text[:200])
         if r.status_code >= 500:
-            self.breaker.record(provider, False)
+            self.breaker.record(provider, False, self._exempt(provider))
             raise ProviderError(provider, "transient", r.text[:200])
         if r.status_code >= 400:
-            self.breaker.record(provider, False)
+            self.breaker.record(provider, False, self._exempt(provider))
             raise ProviderError(provider, "fatal", r.text[:300])
 
-        self.breaker.record(provider, True)
+        self.breaker.record(provider, True, self._exempt(provider))
         self.stats["ok"] += 1
         data = r.json()
         u = data.get("usage") or {}
