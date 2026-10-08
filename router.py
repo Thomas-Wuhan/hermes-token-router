@@ -121,6 +121,17 @@ async def chat_completions(request: Request):
     payload.pop("_data_class", None)
     feats = extract_features(payload)
     route = decide(feats, ROUTES)
+
+    # 显式路由覆盖（请求头 X-Route: default / simple_task / ...）
+    # 用途：调用方知道该任务"质量敏感"或"延迟敏感"时，直接声明，不靠关键词猜
+    force_route = (request.headers.get("x-route") or "").strip()
+    if force_route:
+        for r in ROUTES:
+            if r["name"] == force_route:
+                if r is not route:
+                    log.info("路由覆盖: %s → %s（请求头声明）", route["name"], force_route)
+                route = r
+                break
     chain = [list(x) for x in route.get("chain", [])]
     classification = classify_data({"classify_text": feats["text"], **payload})
     stream = bool(payload.get("stream"))
